@@ -1,0 +1,99 @@
+name: aps-failure-prediction-service
+
+x-service-env: &service-env
+  ENVIRONMENT: local
+  LOG_LEVEL: INFO
+  LOG_JSON: "true"
+  DATABASE_URL: postgresql+asyncpg://aps:aps@db:5432/aps
+  # Defaults let `docker compose up` work with no .env and no API key.
+  JWT_SECRET: ${JWT_SECRET:-local-development-secret-do-not-use-in-production}
+  AUTH_USERNAME: ${AUTH_USERNAME:-operator}
+  AUTH_PASSWORD: ${AUTH_PASSWORD:-operator}
+  ARTIFACTS_DIR: /app/artifacts
+  TRAINING_DATA_PATH: /app/data/sample/aps_sample_train.csv
+  SCHEDULED_INPUT_DIR: /app/data/incoming
+  SCHEDULED_OUTPUT_DIR: /app/data/scored
+  LLM_PROVIDER: ${LLM_PROVIDER:-stub}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+  LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+  DRIFT_PSI_CRITICAL: ${DRIFT_PSI_CRITICAL:-1.0}
+  DRIFT_SHARE_THRESHOLD: ${DRIFT_SHARE_THRESHOLD:-0.1}
+  DRIFT_SAMPLE_SIZE: ${DRIFT_SAMPLE_SIZE:-1000}
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aps
+      POSTGRES_PASSWORD: aps
+      POSTGRES_DB: aps
+    ports:
+      - "5435:5432" # 5435 on the host to avoid clashing with a local postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aps -d aps"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      <<: *service-env
+      # The API never runs the cron jobs; the worker below owns them.
+      SCHEDULER_ENABLED: "false"
+      # Train on first boot if no artifact exists, so the stack is usable
+      # immediately rather than returning 503 from /predict.
+      TRAIN_ON_START: ${TRAIN_ON_START:-true}
+    volumes:
+      - artifacts:/app/artifacts
+      - scoring:/app/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      <<: *service-env
+      SCHEDULER_ENABLED: "true"
+      # Every 5 minutes in local dev so the automation is observable without
+      # waiting until 02:00. Override for production.
+      SCHEDULED_SCORING_CRON: ${SCHEDULED_SCORING_CRON:-*/5 * * * *}
+      SCHEDULED_DRIFT_CRON: ${SCHEDULED_DRIFT_CRON:-*/5 * * * *}
+      TRAIN_ON_START: "false"
+      RUN_MIGRATIONS: "false"
+    volumes:
+      # Read-only artifacts: the worker scores, it never trains.
+      - artifacts:/app/artifacts:ro
+      - scoring:/app/data
+    # The scheduler process serves no public HTTP; uvicorn is only here to keep
+    # the APScheduler event loop alive in-process. Port 8001 so it does not
+    # clash with the API, and the healthcheck is pointed at it.
+    command:
+      ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8001/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  artifacts:
+  scoring:

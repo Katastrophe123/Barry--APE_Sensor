@@ -1,0 +1,2 @@
+Drop CSVs here for the scheduled scoring job to pick up.
+Processed files are moved to ../scored/ so a rerun does not rescore them.
